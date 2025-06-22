@@ -23,6 +23,16 @@ function randomPosition() {
   };
 }
 
+function safeSpawnPosition() {
+  let pos;
+  do {
+    pos = randomPosition();
+  } while (
+    Object.values(mobs).some(m => Math.hypot(m.x - pos.x, m.y - pos.y) < 200)
+  );
+  return pos;
+}
+
 function spawnMob(typeKey) {
   const type = MOB_TYPES[typeKey];
   const pos = randomPosition();
@@ -37,7 +47,7 @@ function spawnMob(typeKey) {
     shape: type.shape,
     color: type.color,
     damage: type.damage,
-    lastHitBy: {} // { petalId: timestamp }
+    lastHitBy: {}
   };
   mobs[mob.id] = mob;
 }
@@ -53,16 +63,18 @@ function spawnPetalOnGround(petal) {
 
 wss.on('connection', (socket) => {
   let playerId = nextPlayerId++;
+  const spawn = safeSpawnPosition();
 
   players[playerId] = {
     id: playerId,
     username: '',
-    x: 0,
-    y: 0,
+    x: spawn.x,
+    y: spawn.y,
     hp: 100,
     maxHp: 100,
     inventory: [],
-    hotbar: []
+    hotbar: [],
+    spawnTime: Date.now()
   };
 
   socket.send(JSON.stringify({ type: 'init', id: playerId }));
@@ -73,16 +85,22 @@ wss.on('connection', (socket) => {
 
       if (data.type === 'join') {
         players[playerId].username = data.username;
-        players[playerId].inventory = new Array(10).fill(null).map(() => ({
+
+        const starterPetal = () => ({
           id: nextPetalId++,
           type: 'basic',
           damage: 5,
           hp: 100,
           color: 'cyan',
-          angle: 0,
-          cooldown: 0
-        }));
-        players[playerId].hotbar = [null, null, null, null, null];
+          angle: 0
+        });
+
+        players[playerId].inventory = [
+          starterPetal(),
+          starterPetal(),
+          ...new Array(8).fill(null)
+        ];
+        players[playerId].hotbar = [players[playerId].inventory[0], null, null, null, null];
       }
 
       else if (data.type === 'move') {
@@ -148,6 +166,7 @@ wss.on('connection', (socket) => {
 function updateMobs() {
   for (const id in mobs) {
     const mob = mobs[id];
+
     if (mob.type === 'WANDERER') {
       mob.x += (Math.random() - 0.5) * mob.speed;
       mob.y += (Math.random() - 0.5) * mob.speed;
@@ -161,7 +180,8 @@ function updateMobs() {
           nearestDist = dist;
         }
       }
-      if (nearest) {
+
+      if (nearest && Date.now() - nearest.spawnTime > 3000) {
         const dx = nearest.x - mob.x;
         const dy = nearest.y - mob.y;
         const len = Math.hypot(dx, dy);
