@@ -12,7 +12,19 @@ server.on('connection', (socket) => {
       const data = JSON.parse(message);
       if (data.type === 'join') {
         id = nextId++;
-        players[id] = { id, username: data.username, x: 0, y: 0 };
+        players[id] = {
+          id,
+          username: data.username,
+          x: 0,
+          y: 0,
+          inventory: new Array(10).fill(null).map(() => ({
+            id: Math.floor(Math.random() * 100000),
+            type: 'basic',
+            damage: 5,
+            color: 'cyan'
+          })),
+          hotbar: [null, null, null, null, null]
+        };
         socket.send(JSON.stringify({ type: 'init', id }));
       } else if (data.type === 'move' && players[id]) {
         players[id].x = data.x;
