@@ -92,7 +92,7 @@ wss.on('connection', (socket) => {
           damage: 5,
           hp: 100,
           color: 'cyan',
-          angle: 0
+          angle: Math.random() * Math.PI * 2
         });
 
         players[playerId].inventory = [
@@ -103,10 +103,10 @@ wss.on('connection', (socket) => {
         players[playerId].hotbar = [players[playerId].inventory[0], null, null, null, null];
       }
 
-      else if (data.type === 'move') {
+      else if (data.type === 'moveIntent') {
         if (players[playerId]) {
-          players[playerId].x = data.x;
-          players[playerId].y = data.y;
+          players[playerId].x += data.dx;
+          players[playerId].y += data.dy;
         }
       }
 
@@ -217,5 +217,4 @@ setInterval(() => {
     if (client.readyState === WebSocket.OPEN) client.send(snapshot);
   });
 }, TICK_RATE);
-
 
