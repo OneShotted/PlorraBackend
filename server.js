@@ -1,220 +1,383 @@
-const WebSocket = require('ws');
-const wss = new WebSocket.Server({ port: process.env.PORT || 8080 });
+import WebSocket, { WebSocketServer } from "ws";
+import { v4 as uuidv4 } from "uuid";
 
-const TICK_RATE = 50;
-const MOB_SPAWN_INTERVAL = 1000;
+const PORT = process.env.PORT || 8080;
+const wss = new WebSocketServer({ port: PORT });
 
-let players = {};
-let mobs = {};
-let petalsOnGround = {};
-let nextPlayerId = 1;
-let nextMobId = 1;
-let nextPetalId = 1;
+console.log(`Petal.io backend running on port ${PORT}`);
 
-const MOB_TYPES = {
-  WANDERER: { maxHp: 20, speed: 2, shape: 'circle', color: 'yellow', damage: 5 },
-  CHASER: { maxHp: 30, speed: 3, shape: 'triangle', color: 'orange', damage: 7 }
-};
+const players = new Map();
+const enemies = new Map();
+const projectiles = new Map();
+const teams = new Map();
 
-function randomPosition() {
-  return {
-    x: Math.random() * 2000 - 1000,
-    y: Math.random() * 2000 - 1000
+const SAFE_ZONE_RADIUS = 200;
+const MAP_SIZE = 3000;
+
+const PETAL_TYPES = ["basic", "rock", "fire", "ice", "poison", "electric", "shield"];
+
+function randRange(min, max) {
+  return Math.random() * (max - min) + min;
+}
+
+function dist(a, b) {
+  return Math.hypot(a.x - b.x, a.y - b.y);
+}
+
+// Enemy spawn helper
+function spawnEnemy(type) {
+  const id = uuidv4();
+  const x = randRange(-MAP_SIZE, MAP_SIZE);
+  const y = randRange(-MAP_SIZE, MAP_SIZE);
+  let enemy = {
+    id,
+    type,
+    x,
+    y,
+    hp: type === "miniboss" ? 150 : type === "spinner" ? 60 : type === "chaser" ? 40 : 20,
+    maxHp: 150,
+    vx: 0,
+    vy: 0,
+    orbitAngle: 0,
+    targetPlayerId: null,
+    petals: [],
+    lastAttackTime: 0,
+    dead: false,
+    size: type === "miniboss" ? 40 : type === "spinner" ? 25 : 15,
   };
+  enemies.set(id, enemy);
 }
 
-function safeSpawnPosition() {
-  let pos;
-  do {
-    pos = randomPosition();
-  } while (
-    Object.values(mobs).some(m => Math.hypot(m.x - pos.x, m.y - pos.y) < 200)
-  );
-  return pos;
-}
+// Initialize enemies every 3 seconds
+setInterval(() => {
+  if (enemies.size < 50) {
+    const types = ["wanderer", "chaser", "spinner"];
+    spawnEnemy(types[Math.floor(Math.random() * types.length)]);
+  }
+  if (Math.random() < 0.01) {
+    spawnEnemy("miniboss");
+  }
+}, 3000);
 
-function spawnMob(typeKey) {
-  const type = MOB_TYPES[typeKey];
-  const pos = randomPosition();
-  const mob = {
-    id: nextMobId++,
-    type: typeKey,
-    x: pos.x,
-    y: pos.y,
-    hp: type.maxHp,
-    maxHp: type.maxHp,
-    speed: type.speed,
-    shape: type.shape,
-    color: type.color,
-    damage: type.damage,
-    lastHitBy: {}
-  };
-  mobs[mob.id] = mob;
-}
+// Remove dead enemies every 5 seconds
+setInterval(() => {
+  for (const [id, e] of enemies) {
+    if (e.dead) enemies.delete(id);
+  }
+}, 5000);
 
-function spawnPetalOnGround(petal) {
-  petalsOnGround[nextPetalId] = {
-    ...petal,
-    id: nextPetalId++,
-    x: petal.x,
-    y: petal.y
-  };
-}
-
-wss.on('connection', (socket) => {
-  let playerId = nextPlayerId++;
-  const spawn = safeSpawnPosition();
-
-  players[playerId] = {
-    id: playerId,
-    username: '',
-    x: spawn.x,
-    y: spawn.y,
+// Player template
+function createNewPlayer(ws) {
+  const id = uuidv4();
+  const player = {
+    id,
+    ws,
+    x: randRange(-MAP_SIZE / 2, MAP_SIZE / 2),
+    y: randRange(-MAP_SIZE / 2, MAP_SIZE / 2),
+    vx: 0,
+    vy: 0,
+    speed: 200,
     hp: 100,
     maxHp: 100,
-    inventory: [],
-    hotbar: [],
-    spawnTime: Date.now()
+    level: 1,
+    xp: 0,
+    coins: 0,
+    petals: [
+      { type: "basic", tier: 1, hp: 20, maxHp: 20, cooldown: 0, broken: false },
+      { type: "basic", tier: 1, hp: 20, maxHp: 20, cooldown: 0, broken: false },
+      { type: "basic", tier: 1, hp: 20, maxHp: 20, cooldown: 0, broken: false },
+    ],
+    inventory: [], // Extra petals stored
+    petalSlots: 3,
+    orbitRadius: 50,
+    orbitSpeed: 1.5,
+    retracting: false,
+    team: null,
+    inSafeZone: false,
+    name: "Anonymous",
+    lastHitTime: 0,
+    dead: false,
+    respawnTimer: 0,
   };
+  players.set(id, player);
+  return player;
+}
 
-  socket.send(JSON.stringify({ type: 'init', id: playerId }));
+function broadcast(data) {
+  const json = JSON.stringify(data);
+  for (const p of players.values()) {
+    if (p.ws.readyState === WebSocket.OPEN) p.ws.send(json);
+  }
+}
 
-  socket.on('message', (msg) => {
-    try {
-      const data = JSON.parse(msg);
+function sendToPlayer(player, data) {
+  if (player.ws.readyState === WebSocket.OPEN) {
+    player.ws.send(JSON.stringify(data));
+  }
+}
 
-      if (data.type === 'join') {
-        players[playerId].username = data.username;
+// Game loop — runs 30 times per second
+const TICK_RATE = 30;
+setInterval(() => {
+  const now = Date.now();
 
-        const starterPetal = () => ({
-          id: nextPetalId++,
-          type: 'basic',
-          damage: 5,
-          hp: 100,
-          color: 'cyan',
-          angle: Math.random() * Math.PI * 2
-        });
-
-        players[playerId].inventory = [
-          starterPetal(),
-          starterPetal(),
-          ...new Array(8).fill(null)
-        ];
-        players[playerId].hotbar = [players[playerId].inventory[0], null, null, null, null];
+  // Update players movement & status
+  for (const player of players.values()) {
+    if (player.dead) {
+      player.respawnTimer -= 1 / TICK_RATE;
+      if (player.respawnTimer <= 0) {
+        player.dead = false;
+        player.hp = player.maxHp;
+        player.x = randRange(-MAP_SIZE / 2, MAP_SIZE / 2);
+        player.y = randRange(-MAP_SIZE / 2, MAP_SIZE / 2);
+        sendToPlayer(player, { type: "respawn" });
       }
+      continue;
+    }
 
-      else if (data.type === 'moveIntent') {
-        if (players[playerId]) {
-          players[playerId].x += data.dx;
-          players[playerId].y += data.dy;
+    // Movement clamped inside map
+    player.x = Math.min(Math.max(player.x + player.vx / TICK_RATE, -MAP_SIZE), MAP_SIZE);
+    player.y = Math.min(Math.max(player.y + player.vy / TICK_RATE, -MAP_SIZE), MAP_SIZE);
+
+    // Check safe zone
+    player.inSafeZone = player.x * player.x + player.y * player.y < SAFE_ZONE_RADIUS * SAFE_ZONE_RADIUS;
+
+    // Petals cooldowns & regeneration
+    player.petals.forEach((petal) => {
+      if (petal.broken) {
+        petal.cooldown -= 1 / TICK_RATE;
+        if (petal.cooldown <= 0) {
+          petal.broken = false;
+          petal.hp = petal.maxHp;
+          petal.cooldown = 0;
         }
       }
+    });
+  }
 
-      else if (data.type === 'updateInventory') {
-        if (players[playerId]) {
-          players[playerId].hotbar = data.hotbar;
-          players[playerId].inventory = data.inventory;
+  // Enemies AI movement & attacking players
+  for (const enemy of enemies.values()) {
+    if (enemy.dead) continue;
+    if (enemy.type === "wanderer") {
+      enemy.vx += randRange(-1, 1);
+      enemy.vy += randRange(-1, 1);
+      enemy.vx *= 0.9;
+      enemy.vy *= 0.9;
+      enemy.x += enemy.vx / TICK_RATE;
+      enemy.y += enemy.vy / TICK_RATE;
+    } else if (enemy.type === "chaser") {
+      // Find closest player
+      let closest = null;
+      let minDist = Infinity;
+      for (const p of players.values()) {
+        if (p.dead) continue;
+        const d = dist(p, enemy);
+        if (d < minDist) {
+          minDist = d;
+          closest = p;
         }
       }
+      if (closest) {
+        const dx = closest.x - enemy.x;
+        const dy = closest.y - enemy.y;
+        const len = Math.max(Math.hypot(dx, dy), 0.001);
+        enemy.vx = (dx / len) * 120;
+        enemy.vy = (dy / len) * 120;
+        enemy.x += enemy.vx / TICK_RATE;
+        enemy.y += enemy.vy / TICK_RATE;
 
-      else if (data.type === 'attackTick') {
-        const player = players[playerId];
-        if (!player) return;
+        // Attack if close
+        if (minDist < 30 && now - enemy.lastAttackTime > 1000) {
+          enemy.lastAttackTime = now;
+          closest.hp -= 15;
+          if (closest.hp <= 0) {
+            closest.dead = true;
+            closest.respawnTimer = 5;
+            // Drop petals on death
+            closest.inventory = [];
+          }
+        }
+      }
+    } else if (enemy.type === "spinner") {
+      enemy.orbitAngle += 0.1;
+      enemy.x += Math.cos(enemy.orbitAngle) * 1.5;
+      enemy.y += Math.sin(enemy.orbitAngle) * 1.5;
+    } else if (enemy.type === "miniboss") {
+      // Miniboss moves slow toward center and attacks players with petal break attack
+      let closest = null;
+      let minDist = Infinity;
+      for (const p of players.values()) {
+        if (p.dead) continue;
+        const d = dist(p, enemy);
+        if (d < minDist) {
+          minDist = d;
+          closest = p;
+        }
+      }
+      if (closest) {
+        const dx = closest.x - enemy.x;
+        const dy = closest.y - enemy.y;
+        const len = Math.max(Math.hypot(dx, dy), 0.001);
+        enemy.vx = (dx / len) * 50;
+        enemy.vy = (dy / len) * 50;
+        enemy.x += enemy.vx / TICK_RATE;
+        enemy.y += enemy.vy / TICK_RATE;
 
-        const now = Date.now();
-        player.hotbar.forEach((petal) => {
-          if (!petal || petal.hp <= 0) return;
-
-          for (const mid in mobs) {
-            const mob = mobs[mid];
-            const dist = Math.hypot(player.x - mob.x, player.y - mob.y);
-            if (dist < 60) {
-              const lastHit = mob.lastHitBy[petal.id] || 0;
-              if (now - lastHit >= 1000) {
-                mob.hp -= petal.damage;
-                mob.lastHitBy[petal.id] = now;
-
-                petal.hp = 0;
-                setTimeout(() => {
-                  if (player.hotbar.includes(petal)) petal.hp = 100;
-                }, 1000);
-
-                if (mob.hp <= 0) {
-                  spawnPetalOnGround({
-                    type: 'basic',
-                    damage: 5,
-                    color: 'cyan',
-                    angle: 0,
-                    x: mob.x,
-                    y: mob.y
-                  });
-                  delete mobs[mid];
-                }
-              }
+        if (minDist < 50 && now - enemy.lastAttackTime > 2000) {
+          enemy.lastAttackTime = now;
+          // Break random petal on player
+          if (closest.petals.length > 0) {
+            const idx = Math.floor(Math.random() * closest.petals.length);
+            const petal = closest.petals[idx];
+            if (!petal.broken) {
+              petal.broken = true;
+              petal.cooldown = 5;
+              petal.hp = 0;
             }
           }
-        });
-      }
-    } catch (e) {
-      console.error('Error:', e);
-    }
-  });
-
-  socket.on('close', () => delete players[playerId]);
-});
-
-function updateMobs() {
-  for (const id in mobs) {
-    const mob = mobs[id];
-
-    if (mob.type === 'WANDERER') {
-      mob.x += (Math.random() - 0.5) * mob.speed;
-      mob.y += (Math.random() - 0.5) * mob.speed;
-    } else {
-      let nearest = null, nearestDist = Infinity;
-      for (const pid in players) {
-        const p = players[pid];
-        const dist = Math.hypot(p.x - mob.x, p.y - mob.y);
-        if (dist < nearestDist) {
-          nearest = p;
-          nearestDist = dist;
-        }
-      }
-
-      if (nearest && Date.now() - nearest.spawnTime > 3000) {
-        const dx = nearest.x - mob.x;
-        const dy = nearest.y - mob.y;
-        const len = Math.hypot(dx, dy);
-        if (len > 0) {
-          mob.x += (dx / len) * mob.speed;
-          mob.y += (dy / len) * mob.speed;
-        }
-
-        if (nearestDist < 30) {
-          nearest.hp -= mob.damage;
-          if (nearest.hp < 0) nearest.hp = 0;
+          closest.hp -= 30;
+          if (closest.hp <= 0) {
+            closest.dead = true;
+            closest.respawnTimer = 5;
+            closest.inventory = [];
+          }
         }
       }
     }
   }
+
+  // Broadcast game state (only necessary data)
+  const snapshot = {
+    type: "update",
+    players: [],
+    enemies: [],
+  };
+
+  for (const p of players.values()) {
+    snapshot.players.push({
+      id: p.id,
+      x: p.x,
+      y: p.y,
+      hp: p.hp,
+      maxHp: p.maxHp,
+      level: p.level,
+      xp: p.xp,
+      coins: p.coins,
+      petals: p.petals.map(pet => ({
+        type: pet.type,
+        tier: pet.tier,
+        hp: pet.hp,
+        maxHp: pet.maxHp,
+        broken: pet.broken,
+      })),
+      petalSlots: p.petalSlots,
+      orbitRadius: p.orbitRadius,
+      orbitSpeed: p.orbitSpeed,
+      name: p.name,
+      dead: p.dead,
+      inSafeZone: p.inSafeZone,
+      team: p.team,
+      inventoryCount: p.inventory.length,
+    });
+  }
+  for (const e of enemies.values()) {
+    snapshot.enemies.push({
+      id: e.id,
+      x: e.x,
+      y: e.y,
+      hp: e.hp,
+      maxHp: e.maxHp,
+      type: e.type,
+      dead: e.dead,
+      size: e.size,
+    });
+  }
+
+  broadcast(snapshot);
+}, 1000 / TICK_RATE);
+
+wss.on("connection", (ws) => {
+  console.log("New player connected");
+  const player = createNewPlayer(ws);
+
+  // Send initial player id & welcome message
+  sendToPlayer(player, { type: "welcome", id: player.id });
+
+  ws.on("message", (msg) => {
+    try {
+      const data = JSON.parse(msg);
+      if (data.type === "input") {
+        if (player.dead) return;
+        // Input contains movement vector and petal commands
+        player.vx = data.vx * player.speed;
+        player.vy = data.vy * player.speed;
+
+        // Handle petal retraction toggle
+        if (typeof data.retract === "boolean") player.retracting = data.retract;
+
+        // Handle inventory actions (add/drop/combine petals)
+        if (data.action) {
+          handleInventoryAction(player, data.action, data.payload);
+        }
+      } else if (data.type === "setName") {
+        player.name = sanitizeString(data.name);
+      }
+    } catch (e) {
+      console.error("Invalid message", e);
+    }
+  });
+
+  ws.on("close", () => {
+    console.log(`Player ${player.id} disconnected`);
+    players.delete(player.id);
+  });
+});
+
+function sanitizeString(str) {
+  return String(str).replace(/[^a-zA-Z0-9 _-]/g, "").substring(0, 15);
 }
 
-setInterval(() => {
-  spawnMob('WANDERER');
-  spawnMob('CHASER');
-}, MOB_SPAWN_INTERVAL);
+function handleInventoryAction(player, action, payload) {
+  if (action === "addPetal" && payload) {
+    // Add new petal to inventory, max 50
+    if (player.inventory.length < 50) {
+      player.inventory.push({
+        type: payload.type,
+        tier: 1,
+        hp: 20,
+        maxHp: 20,
+        broken: false,
+        cooldown: 0,
+      });
+    }
+  } else if (action === "dropPetal" && typeof payload.index === "number") {
+    player.inventory.splice(payload.index, 1);
+  } else if (action === "combinePetals" && Array.isArray(payload.indices)) {
+    // Combine 3 petals of same type and tier into next tier
+    const inds = payload.indices.sort((a, b) => a - b);
+    if (inds.length !== 3) return;
+    const petalsToCombine = inds.map(i => player.inventory[i]).filter(Boolean);
+    if (petalsToCombine.length !== 3) return;
 
-setInterval(() => {
-  updateMobs();
-  const snapshot = JSON.stringify({
-    type: 'state',
-    players,
-    mobs,
-    petalsOnGround
-  });
+    const first = petalsToCombine[0];
+    if (!petalsToCombine.every(p => p.type === first.type && p.tier === first.tier)) return;
 
-  wss.clients.forEach(client => {
-    if (client.readyState === WebSocket.OPEN) client.send(snapshot);
-  });
-}, TICK_RATE);
+    // Remove petals from inventory (from end to start)
+    for (let i = inds.length - 1; i >= 0; i--) {
+      player.inventory.splice(inds[i], 1);
+    }
+
+    // Add combined petal with tier+1 max 3
+    if (first.tier < 3) {
+      player.inventory.push({
+        type: first.type,
+        tier: first.tier + 1,
+        hp: 20 + first.tier * 10,
+        maxHp: 20 + first.tier * 10,
+        broken: false,
+        cooldown: 0,
+      });
+    }
+  }
+}
 
