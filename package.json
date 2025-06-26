@@ -1,14 +1,12 @@
 {
-  "name": "petalio-backend",
+  "name": "clashdot-backend",
   "version": "1.0.0",
-  "description": "Backend server for Petal.io multiplayer game",
-  "type": "module",
   "main": "server.js",
+  "type": "module",
+  "dependencies": {
+    "ws": "^8.15.0"
+  },
   "scripts": {
     "start": "node server.js"
-  },
-  "dependencies": {
-    "ws": "^8.13.0",
-    "uuid": "^9.0.0"
   }
 }
